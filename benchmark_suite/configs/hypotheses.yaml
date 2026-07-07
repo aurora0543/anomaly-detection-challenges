@@ -1,0 +1,15 @@
+# 假设登记表 —— 对应 Verification Handbook v3 §1.3
+# 结果留空，允许证伪。type: hard=硬约束门槛(决定通过/不通过) | prior=文献先验(仅对照) | mixed
+# threshold: 运行前锁定；null 表示待你填写。result: unfilled | supported | partial | not_supported
+
+H1:  {test: C1, type: hard,  statement: "无风扇/功耗封顶下持续实时性无法保障",        criterion: "fps_sustained >= line_speed_fps", threshold: {line_speed_fps: null}, result: unfilled}
+H2:  {test: C2, type: prior, statement: "含注意力模型高分辨率吞吐下降更陡",            criterion: "slope_gap.ci 不跨0 且注意力组更陡",  threshold: null, result: unfilled}
+H3:  {test: C4, type: mixed, statement: "换产重训延迟高，边缘难独立完成",            criterion: "train_time_full_h 高；edge_vs_cloud_ratio 大", threshold: null, result: unfilled}
+H4:  {test: C3, type: prior, statement: "异常检测模型单卡并发承载低于监督模型",        criterion: "max_streams_under_budget(异常) < (监督)", threshold: {latency_budget_ms: 33}, result: unfilled}
+H5:  {test: C5, type: prior, statement: "跨域（跨工位）精度显著退化",                criterion: "degradation_pct.ci 不跨0", threshold: null, result: unfilled}
+H6:  {test: C6, type: mixed, statement: "组件协同升级引发阈值漂移与检测不一致",        criterion: "decision_disagreement_rate 显著; threshold_drift 显著", threshold: null, result: unfilled}
+H7:  {test: M1, type: prior, statement: "高分辨率下内存带宽成为瓶颈、数据搬运占比高",  criterion: "mem_bw_util 近饱和; copy_ratio 高", threshold: null, result: unfilled}
+H8:  {test: M2, type: mixed, statement: "低位宽量化抹除微弱缺陷特征",                criterion: "micro_recall_drop(<10px) >> 大缺陷", threshold: null, result: unfilled}
+H9:  {test: N1, type: prior, statement: "异常检测模型同步开销高于监督模型",            criterion: "fleet_sync_s(异常) > (监督)", threshold: null, result: unfilled}
+H10: {test: N2, type: hard,  statement: "事件触发回传省带宽但需保高危时效",          criterion: "bw_saving_pct 高 且 高危 detect_to_arrival_ms 达标", threshold: {high_risk_latency_ms: null}, result: unfilled}
+H11: {test: N3, type: hard,  statement: "纯软件方案难满足硬实时确定性",              criterion: "e2e p99/max 超预算 或 jitter 大", threshold: {realtime_budget_ms: null}, result: unfilled}

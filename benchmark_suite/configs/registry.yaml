@@ -1,0 +1,59 @@
+# 中央注册表 —— 对应 Verification Handbook v3 §2.2 / §2.3 / §2.1 / §2.4
+# 所有测试脚本从这里读取实体定义，不硬编码。id 为唯一引用键。
+
+hardware:
+  hw.cloud:
+    name: "RTX 5090 / A100"
+    role: "云端训练与基准"
+    status: available            # available | absent
+    measurement_type: real       # real | proxy
+    notes: "全部基准测试、全量训练"
+  hw.edge:
+    name: "Jetson Orin NX (16GB, 100 TOPS)"
+    role: "边缘推理代表"
+    status: absent
+    measurement_type: real
+    proxy_by: hw.cloud            # 未到位时由该硬件功耗封顶代理
+    notes: "无设备时 measurement_type 记为 proxy，不套端侧硬阈值"
+  hw.tiny:
+    name: "Raspberry Pi 4B + Coral TPU"
+    role: "端侧极限 / 无风扇"
+    status: absent
+    measurement_type: real
+    proxy_by: hw.cloud
+
+models:
+  m.yolov8n:   {name: YOLOv8n,  paradigm: conv,           framework: ultralytics, task: detection, train_data: boxes,       default_input: 640, source_repo: fabric-defect-detection,               adapter: ultralytics_weights}
+  m.yolov8s:   {name: YOLOv8s,  paradigm: conv,           framework: ultralytics, task: detection, train_data: boxes,       default_input: 640, source_repo: fabric-defect-detection,               adapter: ultralytics_weights}
+  m.yolov11n:  {name: YOLOv11n, paradigm: conv,           framework: ultralytics, task: detection, train_data: boxes,       default_input: 640, source_repo: fabric-defect-detection,               adapter: ultralytics_weights}
+  m.patchcore: {name: PatchCore, paradigm: feature_embed, framework: anomalib,    task: anomaly,   train_data: normal_only, default_input: 256, source_repo: anomaly_detection_for_textile_industry, adapter: repo_pipeline, extra: {coreset_sampling_ratio: 0.1}}
+  m.rd4ad:     {name: RD4AD,    paradigm: feature_embed,  framework: anomalib,    task: anomaly,   train_data: normal_only, default_input: 256, source_repo: anomaly_detection_for_textile_industry, adapter: repo_pipeline}
+  m.efficientad: {name: EfficientAD, paradigm: feature_embed, framework: anomalib, task: anomaly, train_data: normal_only, default_input: 256, source_repo: anomaly_detection_for_textile_industry, adapter: repo_pipeline, extra: {variants: [S, M, L]}}
+  m.moeclip:   {name: MoECLIP,  paradigm: attention,      framework: pytorch,     task: zeroshot_anomaly, train_data: zeroshot, default_input: 336, source_repo: MoECLIP, adapter: import_model_pkg, extra: {experts: 8, topk: 2, clip_weights: "ViT-L-14-336px"}}
+
+# 范式分组（供 C2 注意力 vs 卷积对照）
+paradigm_groups:
+  attention_group: [m.moeclip]
+  conv_group:      [m.yolov8n, m.patchcore]
+
+datasets:
+  d.mvtec:     {name: "MVTec AD",  format: mask, resolution: "1024x1024", has_mask: true,  train_normal_only: true,  classes: 15, domain_field: category}
+  d.visa:      {name: "VisA",      format: mask, resolution: "multi",      has_mask: true,  train_normal_only: true,  subsets: 12, domain_field: subset}
+  d.sdust:     {name: "SDUST-FDD", format: yolo, resolution: "512x512",    has_mask: false, train_normal_only: false, classes: 6,  domain_field: null}
+  d.rawfabrid: {name: "RAW-FABRID",format: coco, resolution: "1792x1024->256", has_mask: true, train_normal_only: true, classes: null, domain_field: null}
+  d.zju:       {name: "ZJU-Leaper",format: mask, resolution: "256x256",    has_mask: true,  train_normal_only: false, normal_subset_available: true, texture_types: 19, domain_field: texture_type}
+  # normal_subset_available: 训练集虽含异常，但正常图充足，可切出"仅正常"子集训练异常检测（ZJU 有 71127 张正常图）
+
+# 实验 × 数据集 × 模型 兼容矩阵（对应 §2.4）；测试单元尚未实现，此处仅登记合法组合
+test_units:
+  C1: {name: 功耗-热-降频,      dim: compute, datasets: [any],                              models: all,                                        hypothesis: H1, needs: [edge_or_proxy]}
+  C2: {name: 分辨率-吞吐扫频,   dim: compute, datasets: [d.mvtec, d.visa],                  models: [m.moeclip, m.yolov8n, m.patchcore],        hypothesis: H2, needs: [resolution_grid]}
+  C3: {name: 多实例并发,        dim: compute, datasets: [d.sdust, d.mvtec],                 models: all,                                        hypothesis: H4, needs: [multiproc]}
+  C4: {name: 换产训练成本,      dim: compute, datasets: [d.zju],                            models: [m.yolov8n, m.patchcore, m.rd4ad, m.efficientad], hypothesis: H3, needs: [train_to_convergence]}
+  C5: {name: 跨域漂移,          dim: compute, datasets: [d.zju, d.visa],                    models: [m.patchcore, m.rd4ad, m.efficientad],      hypothesis: H5, needs: [natural_domain_split]}
+  C6: {name: 协同升级一致性,    dim: compute, datasets: [any],                              models: any,                                        hypothesis: H6, needs: [two_component_versions]}
+  M1: {name: 带宽竞争,          dim: memory,  datasets: [d.mvtec],                          models: all,                                        hypothesis: H7, needs: [end_to_end_io]}
+  M2: {name: 量化-微缺陷抹除,   dim: memory,  datasets: [d.mvtec, d.visa, d.rawfabrid, d.zju], models: [m.yolov8n, m.yolov8s, m.patchcore, m.efficientad], hypothesis: H8, needs: [pixel_mask]}
+  N1: {name: 模型分发与同步,    dim: comm,    datasets: [any],                              models: all,                                        hypothesis: H9, needs: [tc_netsim]}
+  N2: {name: 事件驱动回传,      dim: comm,    datasets: [d.sdust],                          models: [m.yolov8n, m.yolov8s, m.yolov11n, m.patchcore], hypothesis: H10, needs: [defect_stream]}
+  N3: {name: 端到端控制延迟,    dim: comm,    datasets: [any],                              models: any,                                        hypothesis: H11, needs: [hil_hardware]}

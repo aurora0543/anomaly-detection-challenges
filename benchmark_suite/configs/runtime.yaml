@@ -1,0 +1,30 @@
+# 执行与验证模式 —— 三档执行模型
+#   本地(local)   : 仅做「可行性验证」——导入/装配/合成输入前向，不需 GPU、不需真实数据；缺库/缺权重用 mock 占位
+#   服务器(server): 在 CUDA GPU 服务器上做真实测量，数据集从云端加载
+# 运行时用 run.py --mode {local|server} 选择；默认 local。
+
+default_profile: local
+
+profiles:
+  local:
+    role: feasibility        # feasibility=仅验证程序可行性 | measurement=真实测量
+    device: cpu
+    allow_mock: true         # 缺 torch/权重/数据时，用 mock 模型占位以走通流程
+    data_mode: synthetic     # synthetic=合成张量 | cloud=云端数据集 | local=本地数据
+    # 可行性模式下大幅缩短测量循环（只验证能跑，不求统计意义）
+    warmup: 0
+    iters: 2
+    repeats: 1
+
+  server:
+    role: measurement
+    device: cuda
+    allow_mock: false        # 服务器上禁止 mock，缺依赖即报错
+    data_mode: cloud
+    # warmup/iters/repeats 不覆盖，沿用 measurement.yaml 的正式值
+    warmup: null
+    iters: null
+    repeats: null
+    cloud:
+      dataset_root: "s3://<your-bucket>/datasets"   # 占位：云端数据根，运行前填写
+      weights_root:  "s3://<your-bucket>/weights"    # 占位：模型权重根

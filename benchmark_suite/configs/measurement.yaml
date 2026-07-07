@@ -1,0 +1,29 @@
+# 统一测量规范 —— 对应 Verification Handbook v3 §2.5
+# 所有涉及时间/吞吐的测试共用这些参数。
+
+warmup: 100            # 每配置预热次数（推理类）
+iters: 1000            # 每配置正式测量次数
+repeats: 5             # 整体重复次数（不同种子/进程），取均值±std
+
+percentiles: [50, 95, 99]   # 延迟报告分位数（另含 mean/std/max）
+
+bootstrap:
+  enable: true
+  n_boot: 1000         # 自助重采样次数
+  ci: 0.95             # 置信水平；跨架构/分辨率对比差异需跨越 CI 才算有效
+
+timing:
+  method: cuda_event   # cuda_event（首选，GPU）| perf_counter（CPU 回退）
+  sync_before: true    # 计时前后 torch.cuda.synchronize()
+
+training:
+  # C4 全量训练以收敛为准，禁止用固定少量 epoch 冒充（§2.5）
+  convergence:
+    metric: val_metric      # YOLO=mAP50-95；异常=AUROC
+    patience: 20            # 早停耐心
+    max_epochs: 300
+  smoke_test_epochs: 3      # 仅用于跑通/测吞吐，不用于耗时结论
+
+defaults:
+  batch_size: 1
+  precision: fp32           # fp32 | fp16 | int8 | int4

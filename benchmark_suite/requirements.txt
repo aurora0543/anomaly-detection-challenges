@@ -1,0 +1,12 @@
+# 阶段0（脚手架）必需
+pyyaml>=6.0
+numpy>=1.24
+
+# 后续步骤按需安装（当前脚手架在缺失时会优雅降级）
+# torch>=2.1            # 计时/推理（GPU 用 cuda.Event）
+# pynvml>=11.5          # GPU 功耗/显存/温度采样（C1/M1）
+# psutil>=5.9           # CPU/内存监控（C3/M1）
+# ultralytics>=8.1      # YOLOv8/v11 适配（m.yolov8n/8s/v11n）
+# onnxruntime>=1.17     # 量化导出/评估（M2）
+# anomalib>=1.0         # PatchCore/RD4AD/EfficientAD 备选路线
+# scipy>=1.11           # 分布距离/漂移检测（C5/C6）

@@ -63,10 +63,11 @@ pip-delete-this-directory.txt
 # ==============================================================================
 
 # 1. Ignore Datasets
-/datasets/
-**/datasets/
-**/data/
-**/huafang_raw/
+/datasets/*
+**/datasets/*
+**/data/*
+**/huafang_raw/*
+!/datasets/download_dataset.py
 
 # 2. Ignore Model Weights and Checkpoints (Any deep learning weight formats)
 *.pt

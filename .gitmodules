@@ -1,0 +1,9 @@
+[submodule "models/MoECLIP"]
+	path = models/MoECLIP
+	url = https://github.com/CoCoRessa/MoECLIP.git
+[submodule "models/anomaly_detection_for_textile_industry"]
+	path = models/anomaly_detection_for_textile_industry
+	url = https://github.com/EmanuelePietroCometti/anomaly_detection_for_textile_industry.git
+[submodule "models/fabric-defect-detection"]
+	path = models/fabric-defect-detection
+	url = https://github.com/ashen-pabasara/fabric-defect-detection.git

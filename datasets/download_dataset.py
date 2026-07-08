@@ -7,7 +7,7 @@
   3. Hugging Face Datasets: 通过指定 --hf-repo (例如 aurora0543/raw-fabrid-mvtec)，一键用 API 下载自定义数据集。
 
 依赖需求:
-  pip install requests tqdm huggingface_hub
+  pip install requests tqdm huggingface_hub fiftyone
 """
 
 import os
@@ -18,7 +18,6 @@ import urllib.request
 from pathlib import Path
 
 # 官方公开直链
-MVTEC_URL = "https://www.mydrive.ch/shares/38536/368b1a40a39bf6f4fa757c2835857e62/download/420938113-1629951814/mvtec_anomaly_detection.tar.xz"
 VISA_URL = "https://amazon-visual-anomaly.s3.us-west-2.amazonaws.com/VisA_pytorch.tar"
 
 def download_with_progress(url: str, dest_path: Path):
@@ -57,21 +56,17 @@ def extract_tar(archive_path: Path, dest_dir: Path):
     print("解压完成！")
 
 def handle_mvtec(dest_root: Path):
-    target_dir = dest_root / "MVTec AD"
-    archive_file = dest_root / "mvtec_anomaly_detection.tar.xz"
-    
-    if (target_dir / "bottle").exists():
-        print(f"[INFO] MVTec AD 数据集已存在于 {target_dir}，跳过下载。")
-        return
+    try:
+        import fiftyone as fo
+        import fiftyone.utils.huggingface as fouh
+    except ImportError:
+        print("[ERROR] 使用 MVTec AD 模式需要先安装 fiftyone 包：")
+        print("        pip install fiftyone")
+        sys.exit(1)
 
-    print("=== 开始下载 MVTec AD 数据集 (约 4.9 GB) ===")
-    download_with_progress(MVTEC_URL, archive_file)
-    extract_tar(archive_file, target_dir)
-    
-    # 垃圾回收
-    if archive_file.exists():
-        os.remove(archive_file)
-        print("清理临时压缩包完成。")
+    print("=== 开始通过 FiftyOne 加载 MVTec AD 数据集 ===")
+    dataset = fouh.load_from_hub("Voxel51/mvtec-ad")
+    fo.launch_app(dataset)
 
 def handle_visa(dest_root: Path):
     target_dir = dest_root / "VisA"

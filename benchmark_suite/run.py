@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """编排入口（阶段0 骨架）—— Verification Handbook v3 §2.7 / §4。
 
-当前已实现：注册表加载/校验、环境采集、结果契约自测。
-尚未实现：模型适配器（common/models.py）、数据接口（common/datasets.py）、
-各测试单元（compute/ memory/ communication/）——将在后续授权步骤中分批加入。
+当前已实现：注册表加载/校验、环境采集、结果契约自测、前置检查与权重准备。
 
 用法:
     python run.py --env              # 打印环境元数据
@@ -11,6 +9,8 @@
     python run.py --list             # 列出模型/数据集/测试单元
     python run.py --demo-result      # 走通 result.json 契约（写一条占位结果）
     python run.py --status           # 显示各测试单元的实现状态
+    python run.py --prepare          # 执行前置检查与权重准备 (默认 local 模式)
+    python run.py --prepare --mode server # 真实测量前的权重准备（若有可训练模型缺失，会拉起训练）
     python run.py --check            # 本地可行性验证：各模型 load→合成输入→infer（mock 回退）
     python run.py --check --mode server   # 服务器真实模式（缺依赖会报错，不 mock）
 
@@ -224,13 +224,14 @@ def main():
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--prepare", action="store_true", help="执行前置检查与权重准备")
     ap.add_argument("--demo-result", action="store_true")
     ap.add_argument("--check", action="store_true", help="模型适配层可行性验证")
     ap.add_argument("--mode", choices=["local", "server"], default="local",
                     help="执行档：local=可行性验证(默认) | server=真实测量")
     ap.add_argument("--test", metavar="ID", help="运行某测试单元，如 M2")
     ap.add_argument("--compat", action="store_true", help="显示每个测试的合法(模型×数据集)组合")
-    ap.add_argument("--report", action="store_true", help="聚合全部单元 → 逐假设判定总表 + results/report.md")
+    ap.add_argument("--report", action="store_true", help="聚合同步全部单元 → 逐假设判定总表 + results/report.md")
     ap.add_argument("--source", choices=["memory", "disk"], default="memory",
                     help="报告数据来源：memory=内存跑全部单元(默认) | disk=读 results/ 落盘")
     ap.add_argument("--model", default=None, help="--test 用的模型 id（缺省时各测试用自身默认或跑分组对比）")
@@ -245,6 +246,9 @@ def main():
         cmd_list()
     elif args.status:
         cmd_status()
+    elif args.prepare:
+        from common.prepare import check_and_prepare
+        sys.exit(check_and_prepare(args.mode))
     elif args.check:
         sys.exit(cmd_check(args.mode))
     elif args.compat:

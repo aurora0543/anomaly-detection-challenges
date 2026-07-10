@@ -93,3 +93,11 @@ logs/
 *.png
 *.jpg
 *.jpeg
+
+# 4. Ignore document/report files (PDF, Word, Excel) - not meant to be
+# version-controlled or uploaded.
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx

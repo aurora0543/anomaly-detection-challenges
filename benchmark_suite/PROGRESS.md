@@ -34,8 +34,8 @@
 | C1 功耗-热-降频 | pynvml 真实采样 GPU 功耗/温度/时钟，持续推理循环 | 代码正确但本机无 NVIDIA GPU，无法验证；缺 GPU 时清楚报错，不编造数字 |
 | C2 分辨率-吞吐 | 已有真实计时逻辑，本轮只是让它能吃到真实 adapter | ✅ 已验证，PatchCore 真实 FPS 曲线随分辨率下降 |
 | C3 并发 | CPU 上多线程并发调用 `adapter.infer()`；**MPS/CUDA 上改为单线程+batch=N**（见下方"MPS 线程安全"）；真实 GPU 显存用 pynvml（无 GPU 时为 None） | ✅ 已验证（CPU 线程版 + MPS batch 版都跑过，7 个模型全量并发曲线） |
-| C4 换产训练成本 | 同一模型架构，合成小数据集，真实调用 anomalib `Engine.fit()` / `ultralytics.YOLO.train()`，真实计时+真实最终指标 | ✅ 7 模型中 6 个已验证（PatchCore/RD4AD/SuperSimpleNet/YOLOv8n/v8s/v11n）；EfficientAD 跳过——需首次运行自动下载约 1.5GB Imagenette，用户选择不等 |
-| C5 跨域漂移 | 域A真实训练 → 域A留出/域B测试，真实 anomalib AUROC 对比 | ✅ 3 个异常检测模型已验证（PatchCore/RD4AD/SuperSimpleNet）；EfficientAD 同上原因跳过 |
+| C4 换产训练成本 | 同一模型架构，合成小数据集，真实调用 anomalib `Engine.fit()` / `ultralytics.YOLO.train()`，真实计时+真实最终指标 | ✅ 7 模型全部已验证（含 EfficientAD——用户手动放好 `datasets/imagenette/imagenette2.tgz` 后补跑通过） |
+| C5 跨域漂移 | 域A真实训练 → 域A留出/域B测试，真实 anomalib AUROC 对比 | ✅ 4 个异常检测模型全部已验证（含 EfficientAD） |
 | C6 协同升级一致性 | 同一 checkpoint，FP32 vs FP16 真实推理分数，真实阈值/决策不一致率 | ✅ 6/7 模型已验证；EfficientAD 真实失败（`.half()` 转换后部分内部组件仍是 float32，架构本身限制，不是适配器 bug） |
 | M1 带宽竞争 | N 线程并发真实搬运图像张量，测真实吞吐 GB/s（CUDA 环境为真实 H2D，无 GPU 为 CPU 内存拷贝代理） | ✅ 已验证 |
 | M2 量化-微缺陷抹除 | fp32/fp16/int8_ptq(真实动态量化) 真实推理 + 按缺陷尺寸真实召回率；int8_qat/int4 如实标记不支持（需专用重训/推理库） | ✅ PatchCore/RD4AD/SuperSimpleNet 已验证；EfficientAD 同 C6，FP16 真实失败 |
@@ -90,11 +90,14 @@ buffer 不安全，稳定复现，不是偶发）。已修复为设备感知：C
 ## 六、7 模型 × 剩余测试单元全量补跑（本轮新增）
 
 在 7 个真实训练出的模型上补跑了 C2/C4/C5/C6/M1/M2/N2（此前只用 1-2 个模型验证过机制），32 个
-（测试单元×模型）组合里 27 个真实成功、2 个按用户要求跳过（EfficientAD 的 C4/C5，需要联网自动下载
-约 1.5GB Imagenette，用户选择不等）、2 个是真实失败（EfficientAD 的 C6/M2，`.half()` FP16 转换后
+（测试单元×模型）组合里 **29 个真实成功、2 个是真实失败**（EfficientAD 的 C6/M2，`.half()` FP16 转换后
 部分内部组件类型不匹配，是 EfficientAD 架构本身的限制，其余 6 个模型 FP16 路径都正常，如实标注不是
-硬凑数字）。过程中额外抓到并修复 3 个真实 bug：MPS 显存未在测试间释放导致级联 OOM、EfficientAD 的
-`train_batch_size` 必须严格为 1（C4/C5 合成 Folder 构造未特殊处理）、M2 量化评估的输入张量设备不匹配 +
-这台 ARM Mac 上 `torch.backends.quantized.engine` 默认未设为 `qnnpack`。详细数据见
+硬凑数字）。EfficientAD 的 C4/C5 起初因为要联网自动下载约 1.5GB Imagenette 被跳过——这台机器到 S3 的网络
+极不稳定（`urlretrieve`/curl 断点续传都试过，十几分钟只下几 MB），后来用户手动把
+`datasets/imagenette/imagenette2.tgz` 放到位，用 anomalib 自带的 `download_and_extract()` 校验 SHA256
+（`6cbfac23...`，与源码里写死的哈希完全一致）后解压，C4/C5 也补跑成功了。过程中额外抓到并修复 3 个真实
+bug：MPS 显存未在测试间释放导致级联 OOM、EfficientAD 的 `train_batch_size` 必须严格为 1（C4/C5 合成
+Folder 构造未特殊处理）、M2 量化评估的输入张量设备不匹配 + 这台 ARM Mac 上
+`torch.backends.quantized.engine` 默认未设为 `qnnpack`。详细数据见
 [`../analysis/results/summary.md`](../analysis/results/summary.md) 第四节，原始结果见
 `analysis/results/remaining_tests.json`。

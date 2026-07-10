@@ -76,9 +76,11 @@ metrics.json 解析，不重新跑；速度/参数量/并发吞吐在本机（Ap
 `python benchmark_suite/run.py --test C3 --mode server`（**必须在仓库根目录跑**）。
 
 **本次新增**：C2/C4/C5/C6/M1/M2/N2 共 7 个测试单元也已在全部 7 个真实模型上补跑完（`analysis/run_remaining_tests.py`
-+ `analysis/rerun_m2_n2_only.py`，结果在 `analysis/results/remaining_tests.json`），32 个组合 27 个成功、
-2 个跳过（EfficientAD 的 C4/C5，需联网下载约 1.5GB Imagenette，用户选择不等）、2 个真实失败（EfficientAD 的
-C6/M2，FP16 转换架构本身限制）。详见 [`benchmark_suite/PROGRESS.md`](benchmark_suite/PROGRESS.md) 第六节和
++ `analysis/rerun_m2_n2_only.py` + `analysis/rerun_efficientad_c4c5.py`，结果在 `analysis/results/remaining_tests.json`），
+32 个组合 **29 个成功、2 个真实失败**（EfficientAD 的 C6/M2，FP16 转换架构本身限制）。EfficientAD 的 C4/C5
+起初因联网下载约 1.5GB Imagenette 太慢被跳过，用户手动放好 `datasets/imagenette/imagenette2.tgz` 后
+（用 anomalib 自带的 hash 校验+解压逻辑处理，不是绕过校验）已补跑成功。详见
+[`benchmark_suite/PROGRESS.md`](benchmark_suite/PROGRESS.md) 第六节和
 [`analysis/results/summary.md`](analysis/results/summary.md) 第四节。
 
 已知局限：**没有云端 CUDA 的速度数据可比较**——检查过云端训练日志（ultralytics 的 `results.csv` 没有速度列，

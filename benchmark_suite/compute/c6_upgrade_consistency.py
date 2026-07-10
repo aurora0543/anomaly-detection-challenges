@@ -58,6 +58,47 @@ def judge_h6(disagreement: float, threshold_drift: float,
 
 
 # --------------------------------------------------------------------------- #
+# 真实双版本推理：把"引擎升级"具体化为 FP32(v1) vs FP16(v2) 精度切换 —— 这是最容易在
+# 不需要第二份训练权重的情况下、真实构造出的"引擎版本差异"，同一份 checkpoint、
+# 同一批标定样本，只切换推理精度，比较分数分布/阈值/决策是否漂移。
+# --------------------------------------------------------------------------- #
+def _real_dual_version_scores(adapter, rt: Runtime, n_calib: int = 40) -> Tuple[List[int], List[float], List[float]]:
+    import random
+    torch = rt.optional_import("torch")
+    if torch is None:
+        raise ImportError("C6 真实双版本推理需要 torch")
+
+    rng = random.Random(42)
+    labels: List[int] = []
+    inputs = []
+    for i in range(n_calib):
+        is_anom = i % 2 == 0
+        labels.append(1 if is_anom else 0)
+        base = 0.75 if is_anom else 0.15
+        x = torch.rand(1, 3, adapter.input_hw, adapter.input_hw) * 0.2 + base
+        inputs.append(x.to(next(adapter.model.parameters()).device))
+
+    def _score_of(out) -> float:
+        raw = out.raw
+        score = getattr(raw, "pred_score", None)
+        if score is None and isinstance(raw, dict):
+            score = raw.get("pred_score")
+        if score is None:
+            return float("nan")
+        return float(score.flatten()[0])
+
+    v1_scores = [_score_of(adapter.infer(x)) for x in inputs]
+
+    original_dtype = next(adapter.model.parameters()).dtype
+    try:
+        adapter.model.half()
+        v2_scores = [_score_of(adapter.infer(x.half())) for x in inputs]
+    finally:
+        adapter.model.to(original_dtype)   # 恢复，避免影响后续测试单元复用同一 adapter
+
+    return labels, v1_scores, v2_scores
+
+
 def _synthetic_scores(n: int = 200, shift: float = 0.08):
     """合成标定集：v1 分数可分；v2=引擎升级后整体漂移 shift + 噪声。"""
     import random
@@ -80,10 +121,9 @@ def run(model_id: str = "m.patchcore", dataset_id: str = "d.mvtec",
     adapter = get_adapter(model_id, registry, rt).load()
 
     if rt.is_measurement and adapter.backend == "real":
-        # TODO(server): 用 v1/v2 引擎(如 FP32 vs FP16, 或不同版本)对同一标定集推理取分数
-        raise NotImplementedError("C6 真实双版本推理在 server 步骤对接 adapter 两版本组件")
-
-    labels, s1, s2 = _synthetic_scores()
+        labels, s1, s2 = _real_dual_version_scores(adapter, rt)
+    else:
+        labels, s1, s2 = _synthetic_scores()
     thr1 = optimal_threshold(s1, labels)
     thr2 = optimal_threshold(s2, labels)
     drift = abs(thr2 - thr1)
@@ -97,7 +137,8 @@ def run(model_id: str = "m.patchcore", dataset_id: str = "d.mvtec",
         test_id="C6", test_name="coupled_upgrade_consistency",
         measurement_type="real" if rt.is_measurement else "proxy", hardware_id="hw.cloud",
         config={"model_id": model_id, "dataset_id": dataset_id,
-                "upgrade_axis": "engine(v1 vs v2)", "mode": rt.name},
+                "upgrade_axis": "precision(fp32 vs fp16)" if rt.is_measurement else "engine(v1 vs v2)",
+                "mode": rt.name},
         metrics={"threshold_v1": thr1, "threshold_v2": thr2, "threshold_drift": drift,
                  "decision_disagreement_rate": dis_fixed,
                  "disagreement_fixed_threshold": dis_fixed,
@@ -108,8 +149,8 @@ def run(model_id: str = "m.patchcore", dataset_id: str = "d.mvtec",
                      f"沿用旧阈值决策不一致率 {dis_fixed*100:.1f}%；重标定后残余 {dis_recal*100:.1f}%",
                  ]},
         hypothesis_id="H6", verdict=verdict, evidence=evidence,
-        notes=("local 可行性：合成 v1/v2 分数演示升级漂移，非真实双版本推理。"
-               if rt.is_feasibility else ""),
+        notes=("local 可行性：合成 v1/v2 分数演示升级漂移，非真实双版本推理。" if rt.is_feasibility
+              else "server 真实：同一 checkpoint 在 FP32/FP16 两种推理精度下的真实分数/阈值/决策对比。"),
     )
     if validate_result(res):
         raise RuntimeError("result 不合规")

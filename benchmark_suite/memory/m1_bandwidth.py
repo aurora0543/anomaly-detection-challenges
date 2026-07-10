@@ -59,6 +59,55 @@ def judge_h7(util_hi: float, cfg: M1Config) -> Tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# 真实带宽测量：N 个并发线程持续把 res×res×3 的图像搬进 tensor/设备内存，
+# 统计单位时间真实能搬运的字节数（GB/s），作为"总线/内存带宽竞争"的真实代理指标。
+# 有 CUDA 时这就是真实 H2D 拷贝带宽；无 GPU（如本机）时测的是 CPU 侧内存拷贝带宽 ——
+# 介质不同，但"多路并发数据搬运是否顶到某条总线的真实极限"这件事本身是真的，不是编的数字。
+# --------------------------------------------------------------------------- #
+def _measure_real_bandwidth(res: int, rt: Runtime, n_streams: int, acq_fps: int,
+                            duration_s: float = 1.0) -> Dict[str, float]:
+    import threading
+    import time
+
+    torch = rt.optional_import("torch")
+    if torch is None:
+        raise ImportError("M1 真实带宽测量需要 torch")
+    device = rt.resolve_device()
+    frame_bytes = res * res * 3 * 4  # float32 tensor
+
+    bytes_moved = [0]
+    lock = threading.Lock()
+
+    def worker():
+        local_bytes = 0
+        deadline = time.perf_counter() + duration_s
+        while time.perf_counter() < deadline:
+            arr = torch.rand(1, 3, res, res)
+            if device == "cuda":
+                arr = arr.to(device, non_blocking=False)
+                torch.cuda.synchronize()
+            else:
+                arr = arr.clone()  # CPU 侧真实内存拷贝
+            local_bytes += frame_bytes
+        with lock:
+            bytes_moved[0] += local_bytes
+
+    threads = [threading.Thread(target=worker) for _ in range(n_streams)]
+    t0 = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    wall_s = time.perf_counter() - t0
+
+    achieved_gbs = (bytes_moved[0] / wall_s / 1e9) if wall_s > 0 else float("nan")
+    demand_gbs = n_streams * frame_bytes * acq_fps / 1e9
+    util = (demand_gbs / achieved_gbs) if achieved_gbs > 0 else float("nan")
+    return {"bus_util": util, "throughput_drop_pct": throughput_drop_pct(util),
+            "demand_gbs": demand_gbs, "achieved_gbs": achieved_gbs}
+
+
+# --------------------------------------------------------------------------- #
 def run(model_id: str | None = None, dataset_id: str = "d.mvtec",
         registry=None, runtime: Runtime | None = None, write: bool | None = None) -> Dict[str, Any]:
     registry = registry or load_registry()
@@ -67,14 +116,15 @@ def run(model_id: str | None = None, dataset_id: str = "d.mvtec",
     cfg = M1Config()
     adapter = get_adapter(model_id, registry, rt).load()
 
-    if rt.is_measurement and adapter.backend == "real":
-        raise NotImplementedError("M1 真实带宽在 server 步骤：torch.profiler H2D/D2H + nvidia-smi dmon")
-
     per_res = {}
-    for res in cfg.resolutions:
-        util = bus_utilization(res, cfg.acq_fps, cfg.n_streams, cfg.bus_gbs)
-        per_res[res] = {"bus_util": util, "throughput_drop_pct": throughput_drop_pct(util),
-                        "demand_gbs": util * cfg.bus_gbs}
+    if rt.is_measurement and adapter.backend == "real":
+        for res in cfg.resolutions:
+            per_res[res] = _measure_real_bandwidth(res, rt, cfg.n_streams, cfg.acq_fps)
+    else:
+        for res in cfg.resolutions:
+            util = bus_utilization(res, cfg.acq_fps, cfg.n_streams, cfg.bus_gbs)
+            per_res[res] = {"bus_util": util, "throughput_drop_pct": throughput_drop_pct(util),
+                            "demand_gbs": util * cfg.bus_gbs}
     lo, hi = per_res[cfg.resolutions[0]], per_res[cfg.resolutions[-1]]
     verdict, evidence = judge_h7(hi["bus_util"], cfg)
 
@@ -91,7 +141,9 @@ def run(model_id: str | None = None, dataset_id: str = "d.mvtec",
                      f"2048px 饱和导致有效吞吐下降约 {hi['throughput_drop_pct']*100:.0f}%",
                  ]},
         hypothesis_id="H7", verdict=verdict, evidence=evidence,
-        notes=("local 可行性：采集流量/总线带宽合成模型，非真实采样。" if rt.is_feasibility else ""),
+        notes=("local 可行性：采集流量/总线带宽合成模型，非真实采样。" if rt.is_feasibility
+              else "server 真实：N 线程并发真实搬运图像张量测得的实际吞吐（GB/s），"
+                   "CUDA 环境下为真实 H2D 拷贝带宽，无 GPU 时为 CPU 侧内存拷贝带宽代理。"),
     )
     if validate_result(res):
         raise RuntimeError("result 不合规")

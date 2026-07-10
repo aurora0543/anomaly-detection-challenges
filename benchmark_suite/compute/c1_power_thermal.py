@@ -67,6 +67,54 @@ def judge_h1(fps_sustained: float, line_speed_fps: float) -> Tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# 真实功耗/温度采样：需要 NVIDIA GPU + pynvml（边缘设备可换 tegrastats，接口另接）。
+# 这台开发机没有 NVIDIA GPU，这条路径写好了但没法在本机端到端验证——会在真正的 GPU/
+# 边缘服务器上运行，缺 pynvml/GPU 时给出清楚的报错而不是编造数字。
+# --------------------------------------------------------------------------- #
+def _pynvml_sample() -> Tuple[float, float, float] | None:
+    """返回 (power_w, temp_c, clock_mhz)；无 pynvml 或无 NVIDIA GPU 时返回 None。"""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        power_w = pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0
+        temp_c = float(pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU))
+        clock_mhz = float(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+        pynvml.nvmlShutdown()
+        return power_w, temp_c, clock_mhz
+    except Exception:
+        return None
+
+
+def _real_series(adapter, cfg: C1Config) -> Tuple[List[float], List[float], List[float]]:
+    """持续推理 duration_s，按 sample_hz 采样 (t, fps_instant, temp)，真实 pynvml 读数。"""
+    import time
+
+    if _pynvml_sample() is None:
+        raise RuntimeError(
+            "C1 真实功耗/温度采样需要 NVIDIA GPU + pynvml（`pip install pynvml`）。"
+            "本机/本次运行环境探测不到可用的 NVIDIA GPU，无法产出真实数字——"
+            "请在装了 NVIDIA GPU 的服务器上以 --mode server 重跑此测试单元。"
+        )
+
+    x = adapter.preprocess(None)
+    times, fps, temp = [], [], []
+    period = 1.0 / cfg.sample_hz
+    t_start = time.perf_counter()
+    next_sample = t_start
+    while (time.perf_counter() - t_start) < cfg.duration_s:
+        t0 = time.perf_counter()
+        adapter.infer(x)
+        dt = time.perf_counter() - t0
+        if time.perf_counter() >= next_sample:
+            sample = _pynvml_sample()
+            times.append(time.perf_counter() - t_start)
+            fps.append(1.0 / dt if dt > 0 else float("nan"))
+            temp.append(sample[1] if sample else float("nan"))
+            next_sample += period
+    return times, fps, temp
+
+
 def _synthetic_series(adapter, cfg: C1Config) -> Tuple[List[float], List[float], List[float]]:
     """合成 (times, fps, temp)：受功耗封顶压制峰值 + 被动散热降频。"""
     base = _BASE_FPS.get(adapter.spec.get("paradigm"), 100.0)
@@ -95,9 +143,9 @@ def run(model_id: str = "m.patchcore", dataset_id: str = "d.mvtec",
     adapter = get_adapter(model_id, registry, rt).load()
 
     if rt.is_measurement and adapter.backend == "real":
-        # TODO(server/edge): power.py 后台采样 + 持续推理循环，得到真实 times/fps/temp
-        raise NotImplementedError("C1 真实功耗-热采样在 power.py + 边缘/proxy 步骤对接")
-    times, fps, temp = _synthetic_series(adapter, cfg)
+        times, fps, temp = _real_series(adapter, cfg)
+    else:
+        times, fps, temp = _synthetic_series(adapter, cfg)
 
     stats = analyze_fps_series(times, fps)
     verdict, evidence = judge_h1(stats.get("fps_sustained", float("nan")), cfg.line_speed_fps)
@@ -116,8 +164,8 @@ def run(model_id: str = "m.patchcore", dataset_id: str = "d.mvtec",
                      f"首次降频 @ {stats.get('throttle_onset_s')}s，峰值温度 {max(temp):.0f}°C",
                  ]},
         hypothesis_id="H1", verdict=verdict, evidence=evidence,
-        notes=("local 可行性：功耗封顶+被动散热的合成时序，非真实端侧测量。"
-               if rt.is_feasibility else ""),
+        notes=("local 可行性：功耗封顶+被动散热的合成时序，非真实端侧测量。" if rt.is_feasibility
+              else "server 真实：pynvml 实采功耗/温度，需 NVIDIA GPU（边缘设备应换 tegrastats 等价接口，未实现）。"),
     )
     if validate_result(res):
         raise RuntimeError("result 不合规")

@@ -102,11 +102,15 @@ def _real_anomalib_train(model_id: str, n_samples: int, epochs: int) -> Dict[str
         else {"backbone": "resnet18", "layers": ["layer2", "layer3"]} if cls_name == "Patchcore" else {}
     model = model_cls(**kwargs)
 
+    # EfficientAd 的知识蒸馏机制要求 train_batch_size 严格等于 1（不是可调超参，anomalib
+    # 自己在 __init__ 里断言这个值），其余模型可以正常按样本量取一个小 batch。
+    train_bs = 1 if cls_name == "EfficientAd" else min(8, n_samples)
+
     with tempfile.TemporaryDirectory() as tmp:
         root = _write_synthetic_folder_dataset(_Path(tmp), n_train=n_samples)
         dm = Folder(name="c4_changeover", root=str(root), normal_dir="train/good",
                     normal_test_dir="test/good", abnormal_dir="test/defect",
-                    train_batch_size=min(8, n_samples), eval_batch_size=8, num_workers=0)
+                    train_batch_size=train_bs, eval_batch_size=8, num_workers=0)
         engine = Engine(max_epochs=epochs, accelerator="cpu", devices=1, logger=False,
                         enable_progress_bar=False, default_root_dir=tmp)
         t0 = time.perf_counter()

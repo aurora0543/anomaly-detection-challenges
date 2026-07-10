@@ -113,24 +113,31 @@ def _real_evaluate_precision(precision: str, samples, adapter, rt: Runtime, cfg:
     torch = rt.optional_import("torch")
     raw_model = adapter.model.model   # 底层 nn.Module（PatchcoreModel/ReverseDistillationModel/...）
     original_dtype = next(raw_model.parameters()).dtype
+    original_device = next(raw_model.parameters()).device
 
     try:
         if precision == "fp32":
-            active_model = raw_model
+            active_model, active_device = raw_model, original_device
         elif precision == "fp16":
             raw_model.half()
-            active_model = raw_model
-        else:  # int8_ptq：动态量化（CPU 推理，权重转 int8，激活运行时量化）
+            active_model, active_device = raw_model, original_device
+        else:  # int8_ptq：动态量化只有 CPU 内核实现，MPS/CUDA 上没有对应算子，必须先挪到 CPU
+            raw_model.to("cpu")
+            # ARM（如 Apple Silicon）上量化引擎默认是 'none'，不激活的话 quantize_dynamic
+            # 产出的 quantized::linear_prepack 算子找不到内核实现，需要显式选 qnnpack。
+            if "qnnpack" in torch.backends.quantized.supported_engines:
+                torch.backends.quantized.engine = "qnnpack"
             active_model = torch.ao.quantization.quantize_dynamic(
                 raw_model, {torch.nn.Linear, torch.nn.Conv2d}, dtype=torch.qint8
             )
+            active_device = torch.device("cpu")
 
         scores, labels, size_bins = [], [], []
         for s in samples:
             arr = s.load_array()
             if arr is None:
                 continue
-            x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float()
+            x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().to(active_device)
             x = torch.nn.functional.interpolate(x, size=(adapter.input_hw, adapter.input_hw))
             if precision == "fp16":
                 x = x.half()
@@ -147,7 +154,10 @@ def _real_evaluate_precision(precision: str, samples, adapter, rt: Runtime, cfg:
         thr = optimal_threshold(scores, labels)
         return [(sb, score >= thr) for score, sb in zip(scores, size_bins) if sb is not None]
     finally:
-        raw_model.to(original_dtype)   # 精度切换是破坏性的（半精度/量化会替换权重），跑完必须还原
+        # 精度/设备切换是破坏性的（半精度/量化会替换权重、int8_ptq 会临时挪到 CPU），跑完必须还原，
+        # 否则同一个 adapter 被后续测试单元复用时会带着错误的 dtype/device。
+        raw_model.to(original_device)
+        raw_model.to(original_dtype)
 
 
 # --------------------------------------------------------------------------- #

@@ -75,6 +75,12 @@ metrics.json 解析，不重新跑；速度/参数量/并发吞吐在本机（Ap
 跑法：`python analysis/compare_models.py`（单张推理对比）；并发测试用
 `python benchmark_suite/run.py --test C3 --mode server`（**必须在仓库根目录跑**）。
 
+**本次新增**：C2/C4/C5/C6/M1/M2/N2 共 7 个测试单元也已在全部 7 个真实模型上补跑完（`analysis/run_remaining_tests.py`
++ `analysis/rerun_m2_n2_only.py`，结果在 `analysis/results/remaining_tests.json`），32 个组合 27 个成功、
+2 个跳过（EfficientAD 的 C4/C5，需联网下载约 1.5GB Imagenette，用户选择不等）、2 个真实失败（EfficientAD 的
+C6/M2，FP16 转换架构本身限制）。详见 [`benchmark_suite/PROGRESS.md`](benchmark_suite/PROGRESS.md) 第六节和
+[`analysis/results/summary.md`](analysis/results/summary.md) 第四节。
+
 已知局限：**没有云端 CUDA 的速度数据可比较**——检查过云端训练日志（ultralytics 的 `results.csv` 没有速度列，
 anomalib 的 `Engine` 调用用的是 `logger=False`），云端训练时从没把单张推理耗时记录下来，所以现在只能是
 "MPS 本机内部横向对比"，不是"云端 vs 本机"对比。如果要做这个对比，得专门在云服务器上跑一次

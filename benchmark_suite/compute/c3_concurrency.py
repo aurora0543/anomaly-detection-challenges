@@ -89,13 +89,10 @@ def _gpu_mem_used_mb() -> float | None:
         return None
 
 
-def _real_curve(adapter, cfg: C3Config) -> Tuple[List[float], List[float], List[float | None]]:
-    """真实多线程并发压测：每个并发档位起 N 个线程反复调用 adapter.infer()，
-    跑 duration_s_per_level 秒，统计该档位下的平均单路延迟与总吞吐。
-
-    用线程而非多进程：模型/权重只需加载一次（跨进程复制大模型代价高且要额外处理序列化），
-    而 PyTorch/大多数数值库的算子在真正计算时会释放 GIL，多线程并发下仍能反映真实的
-    单卡/单实例资源争用情况（显存带宽、算子调度队列等），这正是 H4 关心的瓶颈来源。
+def _real_curve_threaded(adapter, cfg: C3Config) -> Tuple[List[float], List[float], List[float | None]]:
+    """CPU 真实多线程并发压测：每个并发档位起 N 个线程反复调用 adapter.infer()，
+    跑 duration_s_per_level 秒，统计该档位下的平均单路延迟与总吞吐。CPU 上多个 OS 线程
+    确实能跑到不同的核上，这个并发方式本身是真实的资源争用。
     """
     import threading
     import time
@@ -134,6 +131,45 @@ def _real_curve(adapter, cfg: C3Config) -> Tuple[List[float], List[float], List[
     return lat_curve, fps_curve, mem_curve
 
 
+def _real_curve_batched(adapter, cfg: C3Config, rt: Runtime) -> Tuple[List[float], List[float], List[float | None]]:
+    """GPU（mps/cuda）并发压测：单线程、把并发数 N 当成 batch size 连续推理，而不是开
+    N 个线程各发一路。
+
+    这不是权宜之计，是真实踩过坑之后确认的正确做法：实测过 PyTorch 的 MPS 后端在多个
+    Python 线程同时提交 Metal command buffer 时会直接原生崩溃（`-[_MTLCommandBuffer commit]`
+    段错误，退出码 139），不是偶发，是可稳定复现的真实限制，不只是"这里跑不了"那么简单。
+    改用批处理后，"单卡支持多少路并发"这件事测的是"batch=N 时的真实吞吐"——这也更贴近生产环境里
+    GPU 推理服务实际处理并发请求的方式（动态批处理），不是给每个请求开一个操作系统线程。
+    """
+    import time
+
+    lat_curve, fps_curve, mem_curve = [], [], []
+    for n in cfg.concurrency:
+        x = rt.synthetic_image(n, 3, adapter.input_hw, adapter.input_hw)
+        n_calls = 0
+        deadline_start = time.perf_counter()
+        deadline = deadline_start + cfg.duration_s_per_level
+        while time.perf_counter() < deadline:
+            adapter.infer(x)
+            n_calls += 1
+        wall_s = time.perf_counter() - deadline_start
+
+        mean_lat = (wall_s / n_calls * 1000.0) if n_calls else float("nan")
+        total_fps = (n_calls * n / wall_s) if wall_s > 0 else float("nan")
+        lat_curve.append(mean_lat)
+        fps_curve.append(total_fps)
+        mem_curve.append(_gpu_mem_used_mb())
+
+    return lat_curve, fps_curve, mem_curve
+
+
+def _real_curve(adapter, cfg: C3Config, rt: Runtime) -> Tuple[List[float], List[float], List[float | None]]:
+    device = rt.resolve_device()
+    if device == "cpu":
+        return _real_curve_threaded(adapter, cfg)
+    return _real_curve_batched(adapter, cfg, rt)
+
+
 def run(model_id: str | None = None, dataset_id: str = "d.sdust",
         registry=None, runtime: Runtime | None = None, write: bool | None = None) -> Dict[str, Any]:
     registry = registry or load_registry()
@@ -150,7 +186,7 @@ def run(model_id: str | None = None, dataset_id: str = "d.sdust",
     for mid in targets:
         adapter = get_adapter(mid, registry, rt).load()
         if rt.is_measurement and adapter.backend == "real":
-            lat, fps, mem = _real_curve(adapter, cfg)
+            lat, fps, mem = _real_curve(adapter, cfg, rt)
         else:
             lat, fps, mem = _synthetic_curve(adapter, cfg)
         ms = max_streams_under_budget(cfg.concurrency, lat, cfg.latency_budget_ms)

@@ -33,7 +33,7 @@
 |---|---|---|
 | C1 功耗-热-降频 | pynvml 真实采样 GPU 功耗/温度/时钟，持续推理循环 | 代码正确但本机无 NVIDIA GPU，无法验证；缺 GPU 时清楚报错，不编造数字 |
 | C2 分辨率-吞吐 | 已有真实计时逻辑，本轮只是让它能吃到真实 adapter | ✅ 已验证，PatchCore 真实 FPS 曲线随分辨率下降 |
-| C3 并发 | 多线程并发调用 `adapter.infer()`，真实延迟/吞吐曲线；真实 GPU 显存用 pynvml（无 GPU 时为 None） | ✅ 已验证，真实延迟随并发数上升 |
+| C3 并发 | CPU 上多线程并发调用 `adapter.infer()`；**MPS/CUDA 上改为单线程+batch=N**（见下方"MPS 线程安全"）；真实 GPU 显存用 pynvml（无 GPU 时为 None） | ✅ 已验证（CPU 线程版 + MPS batch 版都跑过，7 个模型全量并发曲线） |
 | C4 换产训练成本 | 同一模型架构，合成小数据集，真实调用 anomalib `Engine.fit()` / `ultralytics.YOLO.train()`，真实计时+真实最终指标 | ✅ 已验证（PatchCore、YOLOv8n 均测过） |
 | C5 跨域漂移 | 域A真实训练 → 域A留出/域B测试，真实 anomalib AUROC 对比 | ✅ 已验证，真实退化率计算 |
 | C6 协同升级一致性 | 同一 checkpoint，FP32 vs FP16 真实推理分数，真实阈值/决策不一致率 | ✅ 已验证 |
@@ -69,3 +69,20 @@
 2. 跑 `python run.py --test C1 --mode server`、`--test N1 --mode server` 验证 pynvml/tc 真实路径。
 3. 需要 MoECLIP 真实验证的话，先按 `models/MoECLIP/README.md` 备好 `ViT-L-14-336px.pt` + 训出 MoE 头权重。
 4. 各数据集真实目录布局细化、云端存储接入、阈值锁定——按之前的优先级顺序继续。
+
+---
+
+## 五、Apple Silicon (MPS) 支持（本轮新增，真实踩坑修复）
+
+`run.py --mode server` 之前只认 CUDA，在 Mac 上会把 MPS（Apple Silicon 的真实 GPU）误判成"没有 GPU"而
+退化到 CPU——已修复 `common/runtime.py::resolve_device()`（`runtime.yaml` 的 `server` 档现在是
+`device: auto`，按 `cuda → mps → 报错` 顺序选）、`common/env.py::collect_env()`、
+`common/models.py::UltralyticsAdapter`（之前从不显式挪到 GPU/MPS）。
+
+**踩过的坑，写下来避免重复踩**：C3 并发测试原本用"每路开一个 Python 线程"模拟并发，这个方式在
+**MPS 上会直接原生崩溃**（`-[_MTLCommandBuffer commit]` 段错误，退出码 139，多线程同时提交 Metal command
+buffer 不安全，稳定复现，不是偶发）。已修复为设备感知：CPU 用真线程，MPS/CUDA 改为单线程 + batch=N
+（`compute/c3_concurrency.py::_real_curve`）。**如果以后要给别的测试单元加"多线程模拟并发"的逻辑，
+先想一下是不是要跑在 MPS 上，会遇到同样的问题。**
+
+本机（M3 Pro, MPS）全量验证结果见 [`../analysis/results/summary.md`](../analysis/results/summary.md)。

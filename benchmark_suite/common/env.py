@@ -40,6 +40,12 @@ def _gpu_info():
         if not info["gpu"] and torch.cuda.is_available():
             info["gpu"] = torch.cuda.get_device_name(0)
             info["gpu_count"] = torch.cuda.device_count()
+        elif not info["gpu"] and getattr(torch.backends, "mps", None) is not None \
+                and torch.backends.mps.is_available():
+            # Apple Silicon 的 MPS 也是真实 GPU，不是"没有 GPU"——pynvml/CUDA 都探测不到时
+            # 补上这一档，避免 collect_env() 在 Mac 上把 GPU 报告成 None。
+            info["gpu"] = f"Apple Silicon (MPS) - {platform.machine()}"
+            info["gpu_count"] = 1
     except Exception:
         pass
     return info

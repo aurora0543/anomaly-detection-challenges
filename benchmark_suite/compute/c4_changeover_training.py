@@ -42,7 +42,8 @@ class C4Config:
 
 
 _YOLO_BASE_WEIGHTS = {"m.yolov8n": "yolov8n.pt", "m.yolov8s": "yolov8s.pt", "m.yolov11n": "yolo11n.pt"}
-_ANOMALY_MODEL_CLASS = {"m.patchcore": "Patchcore", "m.rd4ad": "ReverseDistillation", "m.efficientad": "EfficientAd"}
+_ANOMALY_MODEL_CLASS = {"m.patchcore": "Patchcore", "m.rd4ad": "ReverseDistillation",
+                        "m.efficientad": "EfficientAd", "m.supersimplenet": "Supersimplenet"}
 
 
 # --------------------------------------------------------------------------- #

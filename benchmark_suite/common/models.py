@@ -106,10 +106,12 @@ class UltralyticsAdapter(BaseModelAdapter):
         weights = self.spec.get("weights_path")
         if not weights or not Path(weights).exists():
             raise FileNotFoundError(f"权重缺失: {weights}")
-        return ul.YOLO(weights)
+        model = ul.YOLO(weights)
+        model.to(self.rt.resolve_device())   # 否则默认停在 CPU，测不出真实 GPU/MPS 速度
+        return model
 
     def _infer_real(self, x) -> ModelOutput:
-        r = self.model.predict(x, verbose=False)
+        r = self.model.predict(x, verbose=False, device=self.rt.resolve_device())
         return ModelOutput(raw=r, backend="real", meta={"task": self.task})
 
 
@@ -132,6 +134,7 @@ class AnomalyRepoAdapter(BaseModelAdapter):
         "m.patchcore": "Patchcore",
         "m.rd4ad": "ReverseDistillation",
         "m.efficientad": "EfficientAd",
+        "m.supersimplenet": "Supersimplenet",
     }
 
     def _load_real(self):

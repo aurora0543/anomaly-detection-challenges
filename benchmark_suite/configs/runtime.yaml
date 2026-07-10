@@ -18,7 +18,7 @@ profiles:
 
   server:
     role: measurement
-    device: cuda
+    device: auto              # 优先 cuda，其次 mps（Apple Silicon 真实 GPU），否则报错——不是只认 cuda
     allow_mock: false        # 服务器上禁止 mock，缺依赖即报错
     data_mode: cloud
     # warmup/iters/repeats 不覆盖，沿用 measurement.yaml 的正式值

@@ -91,6 +91,8 @@ def _real_cross_domain_eval(model_id: str, dataset_id: str, registry, rt: Runtim
     kwargs = {"backbone": "resnet18", "layers": ["layer1", "layer2", "layer3"]} if cls_name == "ReverseDistillation" \
         else {"backbone": "resnet18", "layers": ["layer2", "layer3"]} if cls_name == "Patchcore" else {}
     model = model_cls(**kwargs)
+    # EfficientAd 的知识蒸馏机制要求 train_batch_size 严格等于 1（anomalib 自己在 __init__ 里断言）。
+    train_bs = 1 if cls_name == "EfficientAd" else 4
 
     with tempfile.TemporaryDirectory() as tmp:
         root = _Path(tmp)
@@ -100,7 +102,7 @@ def _real_cross_domain_eval(model_id: str, dataset_id: str, registry, rt: Runtim
 
         dm = Folder(name="c5_domain_a", root=str(root), normal_dir="train/good",
                     normal_test_dir="test/good", abnormal_dir="test/defect",
-                    train_batch_size=4, eval_batch_size=4, num_workers=0)
+                    train_batch_size=train_bs, eval_batch_size=4, num_workers=0)
         engine = Engine(max_epochs=1, accelerator="cpu", devices=1, logger=False,
                         enable_progress_bar=False, default_root_dir=tmp)
         engine.fit(model=model, datamodule=dm)

@@ -46,15 +46,24 @@ class Runtime:
             return None
 
     # -- 有效设备：measurement 想用 cuda 但环境无 torch/cuda 时的处理 --
+    # 注意：Apple Silicon 的 MPS 后端也是真实 GPU，不是"没有 GPU"——之前这里只认 cuda，
+    # 在 Mac 上会被误判成"只能退化成 CPU"，这是本框架的一个真实 bug，不是设备本身的限制。
     def resolve_device(self) -> str:
-        if self.device != "cuda":
+        if self.device == "cpu":
             return "cpu"
         torch = self.optional_import("torch")
-        if torch is not None and torch.cuda.is_available():
-            return "cuda"
+        if self.device == "cuda":
+            if torch is not None and torch.cuda.is_available():
+                return "cuda"
+        elif self.device in ("gpu", "auto", "mps"):
+            if torch is not None and torch.cuda.is_available():
+                return "cuda"
+            if torch is not None and getattr(torch.backends, "mps", None) is not None \
+                    and torch.backends.mps.is_available():
+                return "mps"
         if self.is_feasibility:
             return "cpu"   # 本地无 GPU：可行性验证退回 cpu
-        raise RuntimeError(f"[{self.name}] 请求 cuda 但不可用（torch/CUDA 缺失）。")
+        raise RuntimeError(f"[{self.name}] 请求 GPU（{self.device}）但不可用（torch/CUDA/MPS 均缺失）。")
 
     # -- 合成输入：优先返回 torch 张量，无 torch 时返回 numpy，供可行性前向 --
     def synthetic_image(self, batch: int, ch: int, h: int, w: int):

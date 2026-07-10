@@ -114,25 +114,159 @@ class UltralyticsAdapter(BaseModelAdapter):
 
 
 class AnomalyRepoAdapter(BaseModelAdapter):
-    """PatchCore/RD4AD/EfficientAD —— 复用 anomaly_detection_for_textile_industry 仓库 pipeline。
+    """PatchCore/RD4AD/EfficientAD —— 直接用 anomalib 的 Lightning checkpoint 载入接口。
 
-    真实路径需将该仓库置于 PYTHONPATH 并按 config.yaml 载入；此处先保证可行性(mock)可通，
-    真实 pipeline 对接留待"数据/训练"步骤（因其依赖已训练权重与 config）。
+    anomalib 的模型基类在 __init__ 里调用了 save_hyperparameters()，所以训练时用过的
+    backbone/layers/imagenet_dir 等构造参数都随 checkpoint 一起存了下来 ——
+    直接 `<ModelClass>.load_from_checkpoint(weights_path)` 就能重建完整模型，
+    不需要重新读 config.yaml 猜构造参数。
+
+    真实前向调用的是 lightning_module.model（即 PatchcoreModel/ReverseDistillationModel/
+    EfficientAdModel 这层原始 nn.Module），它们的 forward 都直接接受
+    (N, C, H, W) 的原始张量并在 eval 模式下返回 InferenceBatch(pred_score, anomaly_map, ...)，
+    和 preprocess() 产出的合成/真实图像张量正好对得上，不需要额外套 anomalib 的 Batch 容器。
     """
     adapter_key = "repo_pipeline"
 
+    _MODEL_CLASS_MAP = {
+        "m.patchcore": "Patchcore",
+        "m.rd4ad": "ReverseDistillation",
+        "m.efficientad": "EfficientAd",
+    }
+
     def _load_real(self):
-        # TODO(server步): from src.anomaly_pipeline import load_model; return load_model(cfg)
-        raise NotImplementedError("anomaly 仓库真实对接在后续步骤实现")
+        weights = self.spec.get("weights_path")
+        if not weights or not Path(weights).exists():
+            raise FileNotFoundError(f"权重缺失: {weights}")
+
+        cls_name = self._MODEL_CLASS_MAP.get(self.model_id)
+        if cls_name is None:
+            raise KeyError(f"未知的 anomaly 模型 id '{self.model_id}'，无法映射到 anomalib 模型类")
+
+        anomalib_models = self.rt.optional_import("anomalib.models")
+        if anomalib_models is None:
+            raise ImportError("anomalib 未安装")
+        model_cls = getattr(anomalib_models, cls_name, None)
+        if model_cls is None:
+            raise AttributeError(f"anomalib.models 中找不到 '{cls_name}'")
+
+        torch = self.rt.optional_import("torch")
+        device = self.rt.resolve_device() if torch is not None else "cpu"
+        # weights_only=False: PyTorch >=2.6 defaults torch.load to weights_only=True, which
+        # rejects anomalib's own custom classes (e.g. PrecisionType) pickled into the checkpoint.
+        # Safe here because these are checkpoints this project trained itself, not arbitrary
+        # third-party files.
+        lightning_model = model_cls.load_from_checkpoint(weights, map_location=device, weights_only=False)
+        lightning_model.eval()
+        if torch is not None:
+            lightning_model.to(device)
+        return lightning_model
+
+    def _infer_real(self, x) -> ModelOutput:
+        torch = self.rt.optional_import("torch")
+        with torch.no_grad():
+            out = self.model.model(x)
+        return ModelOutput(raw=out, backend="real", meta={"task": self.task})
 
 
 class MoECLIPAdapter(BaseModelAdapter):
-    """MoECLIP —— import 其 model 包并载入 OpenCLIP 权重。"""
+    """MoECLIP —— zero-shot 异常检测：加载 CLIP 骨干 + MoE adapter 头做真实推理。
+
+    需要 models/MoECLIP 在 PYTHONPATH 上（本适配器按相对路径动态插入），
+    以及两份权重：
+      - clip_weights 指向的基础 CLIP 骨干（如 ViT-L-14-336px.pt，只读、不随本项目训练变化）
+      - spec['weights_path'] 指向的 MoE 头微调权重（moe_last.pth）
+    两者任一缺失都会在 _load_real() 里明确抛出，而不是静默用错误的权重。
+    """
     adapter_key = "import_model_pkg"
 
+    # models/MoECLIP 相对本文件的路径：benchmark_suite/common/models.py -> ../../models/MoECLIP
+    _MOECLIP_ROOT = Path(__file__).resolve().parent.parent.parent / "models" / "MoECLIP"
+
+    # 与 models/MoECLIP/test.py 的 argparser 默认值保持一致（该仓库唯一支持的 CLIP 骨干，
+    # 硬编码在 model/clip.py 的 _MODEL_CKPT_PATHS 里，键名固定为 "ViT-L-14-336"，
+    # 和 registry.yaml extra.clip_weights 里的文件名 "ViT-L-14-336px"（.pt 文件名）不是一回事）
+    _CLIP_MODEL_NAME = "ViT-L-14-336"
+    _DEFAULTS = dict(
+        img_size=518, relu=False, use_paa=True, seg_proj_sharing_strategy="shared",
+        image_adapt_weight=0.1, moe_r=8, moe_lora_alpha=16, moe_layers=(5, 11, 17, 23),
+        use_fofs=True,
+    )
+
     def _load_real(self):
-        # TODO(server步): 将 MoECLIP 置于 PYTHONPATH，from model.model import build_model
-        raise NotImplementedError("MoECLIP 真实对接在后续步骤实现")
+        moe_head_path = self.spec.get("weights_path")
+        if not moe_head_path or not Path(moe_head_path).exists():
+            raise FileNotFoundError(f"MoE 头权重缺失: {moe_head_path}")
+
+        clip_base_path = self._MOECLIP_ROOT / "model" / "ViT-L-14-336px.pt"
+        if not clip_base_path.exists():
+            raise FileNotFoundError(
+                f"CLIP 基础骨干权重缺失: {clip_base_path}（只读权重，需按 MoECLIP README 手动下载）"
+            )
+
+        torch = self.rt.optional_import("torch")
+        if torch is None:
+            raise ImportError("torch 未安装")
+
+        import sys
+        if str(self._MOECLIP_ROOT) not in sys.path:
+            sys.path.insert(0, str(self._MOECLIP_ROOT))
+
+        clip_mod = self.rt.optional_import("model.clip")
+        moe_adapter_mod = self.rt.optional_import("model.moe_adapter")
+        if clip_mod is None or moe_adapter_mod is None:
+            raise ImportError(f"无法从 {self._MOECLIP_ROOT} 导入 model.clip / model.moe_adapter（检查 MoECLIP 子模块是否就位）")
+
+        extra = self.spec.get("extra", {})
+        d = self._DEFAULTS
+        device = self.rt.resolve_device()
+
+        # 1. 基础 CLIP 骨干：走仓库自己的 create_model(pretrained="openai")，
+        #    它内部会用 _MODEL_CKPT_PATHS[_CLIP_MODEL_NAME] 去读本地那份 .pt。
+        clip_model = clip_mod.create_model(
+            model_name=self._CLIP_MODEL_NAME,
+            img_size=d["img_size"],
+            device=device,
+            pretrained="openai",
+            require_pretrained=True,
+        )
+        clip_model.eval()
+
+        # 2. 包上 MoE adapter 头
+        moe_clip = moe_adapter_mod.MoECLIP(
+            clip_model=clip_model,
+            use_paa=d["use_paa"],
+            seg_proj_sharing_strategy=d["seg_proj_sharing_strategy"],
+            image_adapt_weight=d["image_adapt_weight"],
+            moe_r=d["moe_r"],
+            moe_lora_alpha=d["moe_lora_alpha"],
+            moe_num_experts=extra.get("experts", 4),
+            moe_top_k=extra.get("topk", 2),
+            moe_layers=list(d["moe_layers"]),
+            use_fofs=d["use_fofs"],
+            relu=d["relu"],
+        ).to(device)
+        moe_clip.eval()
+
+        # 3. MoE 头权重：checkpoint 是 {"text_adapter":..., "image_adapter":..., "epoch":...}
+        #    这几个子模块分开存的字典，不是整模型一份 state_dict（和 test.py 载入逻辑保持一致）。
+        checkpoint = torch.load(moe_head_path, map_location=device, weights_only=True)
+        if "text_adapter" in checkpoint:
+            moe_clip.text_adapter.load_state_dict(checkpoint["text_adapter"])
+        if "image_adapter" in checkpoint:
+            moe_clip.image_adapter.load_state_dict(checkpoint["image_adapter"])
+        return moe_clip
+
+    def _infer_real(self, x) -> ModelOutput:
+        # MoECLIP.forward(x) 返回 (patch_features, det_feature, ...)（真实前向，见
+        # models/MoECLIP/model/moe_adapter.py 和 test.py 的调用方式）。把这些原始特征转成
+        # 最终的零样本异常分数，还需要 test.py 里另外做的文本 prompt 编码 + 相似度计算这一层，
+        # 这属于具体测试单元（如 C5/M2）按需自行组装的评分逻辑，不是通用 adapter 该做的事——
+        # 这里只保证“真实网络前向”这件事本身是真的，不是 mock。
+        torch = self.rt.optional_import("torch")
+        with torch.no_grad():
+            out = self.model(x)
+        return ModelOutput(raw=out, backend="real", meta={"task": self.task})
 
 
 _ADAPTERS = {

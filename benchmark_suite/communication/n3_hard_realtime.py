@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Tuple
 
 from common.registry import load_registry
 from common.runtime import Runtime, load_runtime
+from common.models import get_adapter
 from common.result import build_result, write_result, validate_result
 
 OS_VARIANTS = ["vanilla_linux", "preempt_rt", "hw_accel"]
@@ -59,6 +60,25 @@ def judge_h11(p99_ms: float, jitter_us: float, budget_ms: float,
 
 
 # --------------------------------------------------------------------------- #
+def _real_software_segment_samples(adapter, n: int) -> List[float]:
+    """真实测量"软件段"延迟：真实模型推理耗时 + 真实的 OS 调度/GC 抖动
+    （用 time.perf_counter() 老老实实测 n 次循环，不注入任何合成抖动模型）。
+
+    这**不是**完整的硬件在环闭环延迟（缺采集卡→PLC→执行机构那几段，见模块顶部说明），
+    只是控制链路里"检测"这一段在当前操作系统上的真实耗时分布 —— 诚实地只测能测的部分，
+    不拿它冒充 H11 需要的完整 HIL 结论（measurement_type 仍然是 proxy，除非 has_hil）。
+    """
+    import time
+
+    x = adapter.preprocess(None)
+    samples = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        adapter.infer(x)
+        samples.append((time.perf_counter() - t0) * 1000.0)
+    return samples
+
+
 def _synthetic_samples(profile: Dict[str, float], n: int) -> List[float]:
     import random
     rng = random.Random(7)
@@ -81,9 +101,21 @@ def run(model_id: str = "m.yolov8n", dataset_id: str = "any",
     has_hil = registry.hardware.get("hw.edge", {}).get("status") == "available"  # HIL 依赖边缘/控制硬件
 
     per_variant = {}
-    for v in OS_VARIANTS:
-        stats = analyze_latency(_synthetic_samples(_LAT_PROFILE[v], cfg.cycles))
-        per_variant[v] = stats
+    used_real_vanilla = False
+    if rt.is_measurement:
+        adapter = get_adapter(model_id, registry, rt).load()
+        if adapter.backend == "real":
+            per_variant["vanilla_linux"] = analyze_latency(_real_software_segment_samples(adapter, cfg.cycles))
+            used_real_vanilla = True
+    if not used_real_vanilla:
+        per_variant["vanilla_linux"] = analyze_latency(_synthetic_samples(_LAT_PROFILE["vanilla_linux"], cfg.cycles))
+    # preempt_rt/hw_accel 需要真实 PREEMPT_RT 内核 / 加速硬件才能测，这台机器没有，
+    # 如实标注为"未测(需专门内核/硬件)"，不拿合成数字冒充对照组。
+    for v in ("preempt_rt", "hw_accel"):
+        if has_hil:
+            per_variant[v] = analyze_latency(_synthetic_samples(_LAT_PROFILE[v], cfg.cycles))
+        else:
+            per_variant[v] = {"status": "not_measured", "reason": f"需要 {v} 专用内核/硬件，当前环境不具备"}
 
     # 以纯软件 vanilla 方案判定 H11
     van = per_variant["vanilla_linux"]
@@ -92,7 +124,9 @@ def run(model_id: str = "m.yolov8n", dataset_id: str = "any",
     status = "ok" if has_hil else "pending_hardware"
     notes = ("需 HIL（PLC/总线）硬件才能出完整实测结论；当前无 HIL，仅软件段延迟画像。"
              if not has_hil else "")
-    if rt.is_feasibility:
+    if used_real_vanilla:
+        notes = "vanilla_linux 为真实模型推理+真实调度抖动测量（非完整 HIL 闭环）。" + (" " + notes if notes else "")
+    elif rt.is_feasibility:
         notes = "local 可行性：合成软件段延迟分布，非真实 HIL 测量。" + (" " + notes if notes else "")
 
     res = build_result(

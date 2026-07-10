@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Tuple
 
 from common.registry import load_registry
 from common.runtime import Runtime, load_runtime
+from common.models import get_adapter
 from common.result import build_result, write_result, validate_result
 
 SCHEMES = ["full", "event", "tiered"]
@@ -58,6 +59,68 @@ def _traffic(cfg: N2Config) -> Dict[str, float]:
     return {"full": full, "event": event, "tiered": tiered}
 
 
+def _real_frame_byte_sizes(resolution: int = 512) -> Tuple[float, float]:
+    """真实编码一帧合成图 + 一个缺陷小块，取真实 JPEG 压缩后字节数（KB），
+    替代原来写死的 frame_kb/patch_kb 常量。"""
+    import io
+    import random
+    from PIL import Image
+
+    rng = random.Random(7)
+    frame = Image.new("RGB", (resolution, resolution),
+                      (rng.randint(180, 220), rng.randint(180, 220), rng.randint(180, 220)))
+    buf = io.BytesIO()
+    frame.save(buf, format="JPEG", quality=85)
+    frame_kb = len(buf.getvalue()) / 1024.0
+
+    patch_size = max(16, resolution // 8)
+    patch = Image.new("RGB", (patch_size, patch_size), (60, 60, 60))
+    buf2 = io.BytesIO()
+    patch.save(buf2, format="JPEG", quality=85)
+    patch_kb = len(buf2.getvalue()) / 1024.0
+    return frame_kb, patch_kb
+
+
+def _real_event_pipeline_latency(adapter, rt: Runtime, n_events: int = 30) -> Dict[str, float]:
+    """真实的"检测触发 -> 事件入队 -> 消费者取出"延迟测量：
+    用真实模型推理产生 T_detect（检测耗时），用真实的 threading.Queue 生产者/消费者
+    测 T_deliver（事件从产生到被下游取走的排队+调度延迟）——这是"事件驱动回传"里
+    真正可以在没有专门网络设备的情况下如实测量的那部分；不模拟局域网/广域网物理链路本身。
+    """
+    import queue
+    import threading
+    import time
+
+    x = adapter.preprocess(None)
+    detect_ms: List[float] = []
+    deliver_ms: List[float] = []
+    q: "queue.Queue[float]" = queue.Queue()
+    stop = object()
+
+    def consumer():
+        while True:
+            item = q.get()
+            if item is stop:
+                return
+            deliver_ms.append((time.perf_counter() - item) * 1000.0)
+
+    t = threading.Thread(target=consumer)
+    t.start()
+    for _ in range(n_events):
+        t0 = time.perf_counter()
+        adapter.infer(x)
+        detect_ms.append((time.perf_counter() - t0) * 1000.0)
+        q.put(time.perf_counter())   # 事件"产生"时刻入队，消费者取出时刻算出排队延迟
+    q.put(stop)
+    t.join()
+
+    return {
+        "detect_ms_mean": sum(detect_ms) / len(detect_ms) if detect_ms else float("nan"),
+        "deliver_ms_mean": sum(deliver_ms) / len(deliver_ms) if deliver_ms else float("nan"),
+        "n_events": n_events,
+    }
+
+
 def run(model_id: str = "m.yolov8n", dataset_id: str = "d.sdust",
         registry=None, runtime: Runtime | None = None, write: bool | None = None) -> Dict[str, Any]:
     registry = registry or load_registry()
@@ -65,18 +128,27 @@ def run(model_id: str = "m.yolov8n", dataset_id: str = "d.sdust",
     model_id = model_id or "m.yolov8n"
     cfg = N2Config()
 
-    # server 真实路径：需检测模型跑注入缺陷的视频流并埋点 T1–T5（后续步骤对接）
+    if rt.is_measurement:
+        adapter = get_adapter(model_id, registry, rt).load()
+        if adapter.backend == "real":
+            frame_kb, patch_kb = _real_frame_byte_sizes()
+            cfg.frame_kb, cfg.patch_kb = frame_kb, patch_kb
+            pipeline = _real_event_pipeline_latency(adapter, rt)
+            high_risk_latency_ms = pipeline["detect_ms_mean"] + pipeline["deliver_ms_mean"]
+        else:
+            high_risk_latency_ms = 120.0
+    else:
+        high_risk_latency_ms = 120.0
+
+    # defect_rate/false_alarm_rate/duration_frames 是产线场景假设（同 C1 的 line_speed_fps），
+    # 不是可以"测量"出来的量；frame_kb/patch_kb 在 server 真实模式下已替换为真实编码字节数。
     tr = _traffic(cfg)
     per_scheme = {}
     for s in SCHEMES:
         per_scheme[s] = {
             "traffic_kb": tr[s],
             "bw_saving_pct": bw_saving_pct(tr["full"], tr[s]) if s != "full" else 0.0,
-            "detect_to_arrival_ms": {"lan": 120, "wan": 900}[  # 名义（文献先验，仅对照）
-                "lan"] if s != "full" else None,
         }
-    # 高危(整帧)在局域网的回传延迟（名义），server 用真实埋点覆盖
-    high_risk_latency_ms = 120.0
     verdict, evidence = judge_h10(per_scheme["event"]["bw_saving_pct"], high_risk_latency_ms, cfg)
 
     res = build_result(
@@ -93,7 +165,9 @@ def run(model_id: str = "m.yolov8n", dataset_id: str = "d.sdust",
                      f"误报率 {cfg.false_alarm_rate*100:.0f}% 抬高实际回传",
                  ]},
         hypothesis_id="H10", verdict=verdict, evidence=evidence,
-        notes=("local 可行性：合成帧流与流量，延迟为文献先验。" if rt.is_feasibility else ""),
+        notes=("local 可行性：合成帧流与流量，延迟为文献先验。" if rt.is_feasibility
+              else "server 真实：帧/块字节数为真实 JPEG 编码测得；高危延迟 = 真实模型推理耗时 + "
+                   "真实线程队列事件投递延迟（同进程内软件事件管线，非物理局域网/广域网链路测量）。"),
     )
     if validate_result(res):
         raise RuntimeError("result 不合规")

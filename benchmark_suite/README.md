@@ -1,6 +1,6 @@
 # benchmark_suite —— 开销挑战验证框架
 
-对应 **Verification Handbook v3**。分步搭建。当前已完成 **核心脚手架 + 执行模型 + 模型适配层骨架**。
+对应 **Verification Handbook v3**。当前已完成 **核心脚手架 + 执行模型 + 全部 11 个测试单元的 server 真实路径 + 2 个模型适配器的真实载入**（状态详见下文与 `PROGRESS.md`）。
 
 ## 执行模型（§2.8，三档）
 
@@ -45,11 +45,15 @@ python run.py --env           # 环境元数据
 python run.py --demo-result   # 走通 result.json 契约
 ```
 
-## 已搭建的适配层（当前步）
+## 已搭建的适配层
 
 - `common/models.py` —— 统一接口 + `MockModel` 回退 + `get_adapter()` 工厂 + `feasibility_check()`
   - `UltralyticsAdapter`（YOLO）：真实载入路径已写（需 ultralytics + 权重）
-  - `AnomalyRepoAdapter` / `MoECLIPAdapter`：接口就位，真实对接标 TODO，本地走 mock
+  - `AnomalyRepoAdapter`（PatchCore/RD4AD/EfficientAD）：**真实对接已完成** —— 用 anomalib 各模型类的
+    `load_from_checkpoint()` 直接载入 `.ckpt`，真实前向调用底层 `nn.Module`。已用本机真实训练的 toy
+    checkpoint 验证过。
+  - `MoECLIPAdapter`：**真实对接已完成**（对照 `models/MoECLIP/test.py` 真实源码重建的加载逻辑），
+    受限于本机缺基础 CLIP 权重和已训练 MoE 头，未做端到端验证，但不是猜的 API。
 
 - `common/datasets.py` —— 统一 `Sample` 流 + 合成回退 + 真实目录扫描；
   `defect_size_bins()`（M2 尺寸分层，scipy 连通域）、`split_by_domain()`（C5 跨域划分）
@@ -68,28 +72,31 @@ python run.py --demo-result   # 走通 result.json 契约
 `python run.py --compat [--test <ID>]` 列出每个测试的合法(模型×数据集)组合；
 跑测试时若显式指定不兼容的 model+dataset 会被挡下（附原因）。规则见 compat.py 顶部注释。
 
-剩余：各单元 server 真实路径对接（真实模型/量化/训练/网络/HIL）。
+**11 个测试单元的 server 真实路径均已实现**（详见 `PROGRESS.md` 的逐单元状态表），9 个已在本机用真实
+anomalib checkpoint 端到端验证；C1/N1 因为本机没有 NVIDIA GPU / 不是 Linux 而无法在本机验证（代码按
+真实 pynvml / tc+HTTP 传输写好，需要在目标 GPU/Linux 服务器上跑）；N3 如实标注"完整硬件在环需要真实
+PLC/总线设备，本仓库只做到软件段的真实测量"，不假装产出完整 HIL 结论。
 
-### 代表性结论（local 合成演示）
+### 代表性结论（举两个例子）
 
 - **C2 分辨率-吞吐扫频**（`compute/c2_resolution_sweep.py`，假设 H2）：分辨率梯度 × log-log 斜率 ×
   注意力组 vs 卷积组对比。核心逻辑 `loglog_slope` / `judge_h2` 可单测。
-  - 运行：`python run.py --test C2 --dataset d.mvtec`
-  - local 用复杂度模型（注意力 O(res⁴) vs 卷积 O(res²)）演示 H2 supported；server 走真实计时
+  - 运行：`python run.py --test C2 --dataset d.mvtec --mode server`
+  - server 模式下对 `adapter.backend=="real"` 的模型做真实计时；其余仍用复杂度模型合成演示。
 - **M2 量化-微缺陷抹除**（`memory/m2_quantization.py`，假设 H8）：精度矩阵
-  FP32/FP16/INT8(PTQ/QAT)/INT4 × 按缺陷尺寸分层召回率 × micro_recall_drop × H8 判定。
+  FP32/FP16/INT8_PTQ（真实量化）× 按缺陷尺寸分层召回率 × micro_recall_drop × H8 判定；
+  INT8_QAT/INT4 如实标注不支持（需专用重训/推理库），不产出编造数字。
   - 可单测核心逻辑：`recall_by_size` / `micro_recall_drop` / `judge_h8`
-  - 运行：`python run.py --test M2 --model m.patchcore --dataset d.mvtec`
-  - local 演示微缺陷召回随量化下降最多（判定 supported）；server 走真实量化评估
+  - 运行：`python run.py --test M2 --model m.patchcore --dataset d.mvtec --mode server`
 
-## 尚未实现（后续分步授权）
+## 仍需要真实硬件才能验证 / 明确未做的部分
 
-- M2 的 server 真实路径：`adapter.export/infer_quantized`（TensorRT/ONNXRuntime/torch.ao）
-- `AnomalyRepoAdapter` / `MoECLIPAdapter` 的真实载入对接（需仓库上 PYTHONPATH + 权重/config）
-- 各数据集特殊目录布局的真实扫描细化（现为通用 glob + 掩膜命名配对）
-- `common/power.py` —— pynvml/tegrastats 采样、功耗封顶
-- `common/report.py` —— result.json 聚合成表/曲线/逐假设判定
-- `compute/` `memory/` `communication/` —— 11 个测试单元 C1-C6 / M1-M2 / N1-N3
+详见 `PROGRESS.md` 第三节，摘要：
+- C1（功耗/温度）、N1（tc 网络限速）：代码已实现，需要 NVIDIA GPU / Linux+root+tc 才能实际验证。
+- N3 的完整 HIL 闭环：需要真实 PLC/总线/执行机构硬件，架构性限制，不是待办。
+- M2 的 int8_qat / int4：需要专用重训/推理库，明确标注不支持。
+- 各数据集真实目录布局的精细适配（现为通用 glob + 掩膜命名配对）、云端 `dataset_root`/`weights_root` 接入、
+  `hypotheses.yaml` 阈值锁定。
 
 ## 设计约定（摘自 Handbook）
 

@@ -94,6 +94,63 @@ def judge_h8(drops_by_precision: Dict[str, Dict[str, float]]) -> Tuple[str, str]
 
 
 # --------------------------------------------------------------------------- #
+# 真实量化评估：fp32(基线)/fp16(半精度)/int8_ptq(动态量化) 都是可以在通用 CPU/GPU 上
+# 直接跑通的真实精度切换；int8_qat 需要量化感知重训、int4 需要专用推理库/硬件支持，
+# 这两者超出了"拿到一个训练好的 checkpoint 就能测"的通用 adapter 范围，如实标注不支持，
+# 不假装产出数字。
+# --------------------------------------------------------------------------- #
+_REAL_SUPPORTED_PRECISIONS = ("fp32", "fp16", "int8_ptq")
+
+
+def _real_evaluate_precision(precision: str, samples, adapter, rt: Runtime, cfg: M2Config
+                             ) -> List[Tuple[str, bool]]:
+    if precision not in _REAL_SUPPORTED_PRECISIONS:
+        raise NotImplementedError(
+            f"M2 真实路径暂不支持精度 '{precision}'：int8_qat 需要量化感知重训、"
+            f"int4 需要专用推理库（如 TensorRT/bitsandbytes），超出通用 checkpoint adapter 范围。"
+        )
+
+    torch = rt.optional_import("torch")
+    raw_model = adapter.model.model   # 底层 nn.Module（PatchcoreModel/ReverseDistillationModel/...）
+    original_dtype = next(raw_model.parameters()).dtype
+
+    try:
+        if precision == "fp32":
+            active_model = raw_model
+        elif precision == "fp16":
+            raw_model.half()
+            active_model = raw_model
+        else:  # int8_ptq：动态量化（CPU 推理，权重转 int8，激活运行时量化）
+            active_model = torch.ao.quantization.quantize_dynamic(
+                raw_model, {torch.nn.Linear, torch.nn.Conv2d}, dtype=torch.qint8
+            )
+
+        scores, labels, size_bins = [], [], []
+        for s in samples:
+            arr = s.load_array()
+            if arr is None:
+                continue
+            x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float()
+            x = torch.nn.functional.interpolate(x, size=(adapter.input_hw, adapter.input_hw))
+            if precision == "fp16":
+                x = x.half()
+            with torch.no_grad():
+                out = active_model(x)
+            score = getattr(out, "pred_score", out)
+            score = float(score.flatten()[0]) if hasattr(score, "flatten") else float(score)
+            is_anom = s.label == "anomaly"
+            scores.append(score)
+            labels.append(1 if is_anom else 0)
+            size_bins.append(defect_size_of(s, cfg.size_bins) if is_anom else None)
+
+        from compute.c6_upgrade_consistency import optimal_threshold
+        thr = optimal_threshold(scores, labels)
+        return [(sb, score >= thr) for score, sb in zip(scores, size_bins) if sb is not None]
+    finally:
+        raw_model.to(original_dtype)   # 精度切换是破坏性的（半精度/量化会替换权重），跑完必须还原
+
+
+# --------------------------------------------------------------------------- #
 # 评估器：真实（server）/ 合成（local）
 # --------------------------------------------------------------------------- #
 def _evaluate_precision(cfg: M2Config, precision: str, samples, adapter, rt: Runtime
@@ -101,9 +158,7 @@ def _evaluate_precision(cfg: M2Config, precision: str, samples, adapter, rt: Run
     """返回 [(size_bin, detected)]，仅统计有缺陷样本。"""
     records = []
     if rt.is_measurement and adapter.backend == "real":
-        # 真实路径（server）：对该精度导出的模型逐样本推理 + 阈值判缺陷
-        # TODO(server): pred = adapter.infer_quantized(sample, precision); detected = pred.is_anomaly
-        raise NotImplementedError("M2 真实量化评估在 server 步骤对接 adapter.export/infer_quantized")
+        return _real_evaluate_precision(precision, samples, adapter, rt, cfg)
     else:
         # 合成评估器（local 可行性，确定性）：按 miss_prob 期望值对每个尺寸箱标注漏检，
         # 去除随机噪声，让 H8 模式（micro 掉最多）清晰可读。属带标注的逻辑演示，非真实测量。
@@ -147,8 +202,14 @@ def run(model_id: str | None = None, dataset_id: str | None = None,
 
     per_precision: Dict[str, Any] = {}
     recalls: Dict[str, Dict[str, float]] = {}
+    unsupported_precisions: List[str] = []
     for prec in cfg.precisions:
-        recs = _evaluate_precision(cfg, prec, samples, adapter, rt)
+        try:
+            recs = _evaluate_precision(cfg, prec, samples, adapter, rt)
+        except NotImplementedError as e:
+            unsupported_precisions.append(prec)
+            per_precision[prec] = {"status": "unsupported", "reason": str(e)}
+            continue
         rc = recall_by_size(recs, cfg.size_bins)
         recalls[prec] = rc
         per_precision[prec] = {
@@ -161,7 +222,7 @@ def run(model_id: str | None = None, dataset_id: str | None = None,
         }
 
     baseline = recalls.get("fp32", {})
-    drops = {p: micro_recall_drop(baseline, recalls[p]) for p in cfg.precisions if p != "fp32"}
+    drops = {p: micro_recall_drop(baseline, recalls[p]) for p in recalls if p != "fp32"}
     for p in drops:
         per_precision[p]["recall_drop_by_size"] = drops[p]
     verdict, evidence = judge_h8(drops)
@@ -178,8 +239,10 @@ def run(model_id: str | None = None, dataset_id: str | None = None,
                  "micro_recall_drop_by_precision": drops,
                  "recall_by_size_by_precision": recalls},
         hypothesis_id="H8", verdict=verdict, evidence=evidence,
-        notes=("local 可行性：合成评估器演示 H8 模式，非真实测量。"
-               if rt.is_feasibility else ""),
+        notes=("local 可行性：合成评估器演示 H8 模式，非真实测量。" if rt.is_feasibility
+              else ("server 真实：fp32/fp16/int8_ptq(动态量化) 为真实推理+按尺寸分层召回率。"
+                    + (f" 不支持的精度（如实跳过，未产出数字）：{unsupported_precisions}。"
+                       if unsupported_precisions else ""))),
     )
 
     issues = validate_result(res)
